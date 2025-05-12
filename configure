@@ -330,6 +330,7 @@ External library support:
   --enable-vapoursynth     enable VapourSynth demuxer [no]
   --disable-xlib           disable xlib [autodetect]
   --disable-zlib           disable zlib [autodetect]
+  --enable-zlm             enable ZLM support via libmk_api [no]
 
   The following libraries provide various hardware acceleration features:
   --disable-amf            disable AMF video encoding code [autodetect]
@@ -1916,6 +1917,7 @@ EXTERNAL_LIBRARY_LIST="
     openssl
     pocketsphinx
     vapoursynth
+    zlm
 "
 
 HWACCEL_AUTODETECT_LIBRARY_LIST="
@@ -3569,6 +3571,7 @@ wtv_demuxer_select="mpegts_demuxer riffdec"
 wtv_muxer_select="mpegts_muxer riffenc"
 xmv_demuxer_select="riffdec"
 xwma_demuxer_select="riffdec"
+zlm_player_demuxer_deps="zlm"
 
 # indevs / outdevs
 android_camera_indev_deps="android camera2ndk mediandk pthreads"
@@ -6830,6 +6833,11 @@ enabled libvpx            && {
     fi
 }
 
+enabled zlm && {
+    enable zlm_player_demuxer && 
+    check_lib zlm mk/mk_mediakit.h mk_env_init -lmk_api || die "ERROR: zlm not found";
+    LIBZLM_LIBS="-lmk_api"
+}
 enabled libwebp           && {
     enabled libwebp_encoder      && require_pkg_config libwebp "libwebp >= 0.2.0" webp/encode.h WebPGetEncoderVersion
     enabled libwebp_anim_encoder && check_pkg_config libwebp_anim_encoder "libwebpmux >= 0.4.0" webp/mux.h WebPAnimEncoderOptionsInit; }
