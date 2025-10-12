@@ -36,7 +36,6 @@
 #include "rtp.h"
 #include "rtc.h"
 
-
 /**
  * The maximum size of the Secure Real-time Transport Protocol (SRTP) HMAC checksum
  * and padding that is appended to the end of the packet. To calculate the maximum
@@ -44,26 +43,6 @@
  * this size from the `pkt_size`.
  */
 #define DTLS_SRTP_CHECKSUM_LEN 16
-
-/**
- * The RTP header is 12 bytes long, comprising the Version(1B), PT(1B),
- * SequenceNumber(2B), Timestamp(4B), and SSRC(4B).
- * See https://www.rfc-editor.org/rfc/rfc3550#section-5.1
- */
-#define WHIP_RTP_HEADER_SIZE 12
-
-/**
- * For RTCP, PT is [128, 223] (or without marker [0, 95]). Literally, RTCP starts
- * from 64 not 0, so PT is [192, 223] (or without marker [64, 95]), see "RTCP Control
- * Packet Types (PT)" at
- * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-4
- *
- * For RTP, the PT is [96, 127], or [224, 255] with marker. See "RTP Payload Types (PT)
- * for standard audio and video encodings" at
- * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1
- */
-#define WHIP_RTCP_PT_START 192
-#define WHIP_RTCP_PT_END   223
 
 /**
  * Refer to RFC 7675 5.1,
@@ -78,24 +57,6 @@
 
 /* Calculate the elapsed time from starttime to endtime in milliseconds. */
 #define ELAPSED(starttime, endtime) ((float)(endtime - starttime) / 1000)
-
-/**
- * In RTP packets, the first byte is represented as 0b10xxxxxx, where the initial
- * two bits (0b10) indicate the RTP version,
- * see https://www.rfc-editor.org/rfc/rfc3550#section-5.1
- * The RTCP packet header is similar to RTP,
- * see https://www.rfc-editor.org/rfc/rfc3550#section-6.4.1
- */
-static int media_is_rtp_rtcp(const uint8_t *b, int size)
-{
-    return size >= WHIP_RTP_HEADER_SIZE && (b[0] & 0xC0) == 0x80;
-}
-
-/* Whether the packet is RTCP. */
-static int media_is_rtcp(const uint8_t *b, int size)
-{
-    return size >= WHIP_RTP_HEADER_SIZE && b[1] >= WHIP_RTCP_PT_START && b[1] <= WHIP_RTCP_PT_END;
-}
 
 /**
  * When duplicating a stream, the demuxer has already set the extradata, profile, and
@@ -251,7 +212,6 @@ static int parse_codec(AVFormatContext *s)
     return ret;
 }
 
-
 /**
  * Callback triggered by the RTP muxer when it creates and sends out an RTP packet.
  *
@@ -268,11 +228,11 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
     SRTPContext *srtp;
 
     /* Ignore if not RTP or RTCP packet. */
-    if (!media_is_rtp_rtcp(buf, buf_size))
+    if (!ff_rtc_media_is_rtp_rtcp(buf, buf_size))
         return 0;
 
     /* Only support audio, video and rtcp. */
-    is_rtcp = media_is_rtcp(buf, buf_size);
+    is_rtcp = ff_rtc_media_is_rtcp(buf, buf_size);
     payload_type = buf[1] & 0x7f;
     is_video = payload_type == rtc->video_payload_type;
     if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
@@ -282,7 +242,7 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
     srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
 
     /* Encrypt by SRTP and send out. */
-    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
+    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, rtc->bufsize);
     if (cipher_size <= 0 || cipher_size < buf_size) {
         av_log(rtc, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
         return 0;
@@ -575,7 +535,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
      */
     if (now - rtc->rtc_last_consent_tx_time > WHIP_ICE_CONSENT_CHECK_INTERVAL * RTC_US_PER_MS) {
         int size;
-        ret = ff_rtc_ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
+        ret = ff_rtc_ice_create_request(s, rtc->buf, rtc->bufsize, &size);
         if (ret < 0) {
             av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
             goto end;
@@ -593,7 +553,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
      * Receive packets from the server such as ICE binding requests, DTLS messages,
      * and RTCP like PLI requests, then respond to them.
      */
-    ret = ffurl_read(rtc->udp, rtc->buf, sizeof(rtc->buf));
+    ret = ffurl_read(rtc->udp, rtc->buf, rtc->bufsize);
     if (ret < 0) {
         if (ret == AVERROR(EAGAIN))
             goto write_packet;
@@ -616,7 +576,7 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
             goto end;
         }
     }
-    if (media_is_rtcp(rtc->buf, ret)) {
+    if (ff_rtc_media_is_rtcp(rtc->buf, ret)) {
         uint8_t fmt = rtc->buf[0] & 0x1f;
         uint8_t pt = rtc->buf[1];
         /**

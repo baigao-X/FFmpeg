@@ -640,6 +640,7 @@ OBJS-$(CONFIG_WEBM_CHUNK_MUXER)          += webm_chunk.o
 OBJS-$(CONFIG_WEBP_MUXER)                += webpenc.o
 OBJS-$(CONFIG_WEBVTT_DEMUXER)            += webvttdec.o subtitles.o
 OBJS-$(CONFIG_WEBVTT_MUXER)              += webvttenc.o
+OBJS-$(CONFIG_WHEP_DEMUXER)              += whep.o rtc.o avc.o http.o srtp.o
 OBJS-$(CONFIG_WHIP_MUXER)                += whip.o rtc.o avc.o http.o srtp.o
 OBJS-$(CONFIG_WSAUD_DEMUXER)             += westwood_aud.o
 OBJS-$(CONFIG_WSAUD_MUXER)               += westwood_audenc.o

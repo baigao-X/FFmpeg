@@ -27,7 +27,10 @@
 #include "url.h"
 #include "tls.h"
 #include "srtp.h"
+#include "rtpdec.h"
+#include "network.h"
 
+#include "libavutil/base64.h"
 #include "libavutil/lfg.h"
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
@@ -80,6 +83,25 @@ enum RTCState {
  * but please keep in mind that the `pkt_size` option limits the packet size to 1400.
  */
 #define MAX_UDP_BUFFER_SIZE 4096
+
+/**
+ * RTC stream information parsed from SDP
+ */
+typedef struct RTCStreamInfo {
+    int payload_type;
+    enum AVMediaType codec_type;
+    char *codec_name;
+    uint32_t ssrc;
+    int clock_rate;
+    char *fmtp;
+    int channels;
+
+    char *direction;
+
+    /* RTX information */
+    int rtx_pt;
+    uint32_t rtx_ssrc;
+} RTCStreamInfo;
 
 typedef struct RTCContext {
     AVClass *av_class;
@@ -178,10 +200,16 @@ typedef struct RTCContext {
     /* The SRTP receive context, to decrypt incoming packets. */
     SRTPContext srtp_recv;
 
+    /* SRTP suite and parameters */
+    char suite[64];
+    char send_suite_param[AV_BASE64_SIZE(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN)];
+    char recv_suite_param[AV_BASE64_SIZE(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN)];
+
     /* The UDP transport is used for delivering ICE, DTLS and SRTP packets. */
     URLContext *udp;
     /* The buffer for UDP transmission. */
-    char buf[MAX_UDP_BUFFER_SIZE];
+    uint8_t* buf;
+    int bufsize;
 
     /* The timeout in milliseconds for ICE and DTLS handshake. */
     int handshake_timeout;
@@ -199,6 +227,10 @@ typedef struct RTCContext {
     /* The certificate and private key used for DTLS handshake. */
     char* cert_file;
     char* key_file;
+
+    /* for demuxer */
+    RTCStreamInfo **stream_infos;
+    int nb_stream_infos;
 } RTCContext;
 
 int ff_rtc_initialize(AVFormatContext *s);
@@ -214,6 +246,10 @@ int ff_rtc_ice_is_binding_request(uint8_t *b, int size);
 int ff_rtc_ice_is_binding_response(uint8_t *b, int size);
 
 int ff_rtc_ice_create_request(AVFormatContext *s, uint8_t *buf, int buf_size, int *request_size);
+
+int ff_rtc_media_is_rtp_rtcp(const uint8_t *b, int size);
+
+int ff_rtc_media_is_rtcp(const uint8_t *b, int size);
 
 extern const AVOption ff_rtc_options[];
 

@@ -140,7 +140,7 @@ static const RTPDynamicProtocolHandler *const rtp_dynamic_protocol_handler_list[
  * @return the next registered rtp dynamic protocol handler
  *         or NULL when the iteration is finished
  */
-static const RTPDynamicProtocolHandler *rtp_handler_iterate(void **opaque)
+const RTPDynamicProtocolHandler *ff_rtp_handler_iterate(void **opaque)
 {
     uintptr_t i = (uintptr_t)*opaque;
     const RTPDynamicProtocolHandler *r = rtp_dynamic_protocol_handler_list[i];
@@ -156,7 +156,7 @@ const RTPDynamicProtocolHandler *ff_rtp_handler_find_by_name(const char *name,
 {
     void *i = 0;
     const RTPDynamicProtocolHandler *handler;
-    while (handler = rtp_handler_iterate(&i)) {
+    while ((handler = ff_rtp_handler_iterate(&i))) {
         if (handler->enc_name &&
             !av_strcasecmp(name, handler->enc_name) &&
             codec_type == handler->codec_type)
@@ -170,7 +170,7 @@ const RTPDynamicProtocolHandler *ff_rtp_handler_find_by_id(int id,
 {
     void *i = 0;
     const RTPDynamicProtocolHandler *handler;
-    while (handler = rtp_handler_iterate(&i)) {
+    while ((handler = ff_rtp_handler_iterate(&i))) {
         if (handler->static_payload_id && handler->static_payload_id == id &&
             codec_type == handler->codec_type)
             return handler;

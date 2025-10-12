@@ -19,6 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavcodec/avcodec.h"
+#include "libavcodec/codec_desc.h"
+#include "libavcodec/defs.h"
+#include "libavcodec/h264.h"
+#include "libavcodec/h264_levels.h"
 #include "libavutil/time.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/random_seed.h"
@@ -26,18 +31,21 @@
 #include "libavutil/hmac.h"
 #include "libavutil/mem.h"
 #include "libavutil/base64.h"
+#include "libavutil/parseutils.h"
 
 #include "avio_internal.h"
 #include "internal.h"
 #include "network.h"
 #include "http.h"
 #include "rtc.h"
+#include "rtp.h"
+#include "rtpdec.h"
 
 /**
  * Maximum size limit of a Session Description Protocol (SDP),
  * be it an offer or answer.
  */
-#define MAX_SDP_SIZE 8192
+#define MAX_SDP_SIZE 16384
 
 /**
  * The size of the Secure Real-time Transport Protocol (SRTP) master key material
@@ -87,19 +95,30 @@
 #define DTLS_VERSION_10 0xfeff
 #define DTLS_VERSION_12 0xfefd
 
-/**
- * Maximum size of the buffer for sending and receiving UDP packets.
- * Please note that this size does not limit the size of the UDP packet that can be sent.
- * To set the limit for packet size, modify the `pkt_size` parameter.
- * For instance, it is possible to set the UDP buffer to 4096 to send or receive packets,
- * but please keep in mind that the `pkt_size` option limits the packet size to 1400.
- */
-#define MAX_UDP_BUFFER_SIZE 4096
-
 /* Referring to Chrome's definition of RTP payload types. */
 #define RTC_RTP_PAYLOAD_TYPE_H264 106
 #define RTC_RTP_PAYLOAD_TYPE_OPUS 111
 #define RTC_RTP_PAYLOAD_TYPE_VIDEO_RTX 105
+
+ /**
+ * The RTP header is 12 bytes long, comprising the Version(1B), PT(1B),
+ * SequenceNumber(2B), Timestamp(4B), and SSRC(4B).
+ * See https://www.rfc-editor.org/rfc/rfc3550#section-5.1
+ */
+#define RTC_RTP_HEADER_SIZE 12
+
+/**
+ * For RTCP, PT is [128, 223] (or without marker [0, 95]). Literally, RTCP starts
+ * from 64 not 0, so PT is [192, 223] (or without marker [64, 95]), see "RTCP Control
+ * Packet Types (PT)" at
+ * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-4
+ *
+ * For RTP, the PT is [96, 127], or [224, 255] with marker. See "RTP Payload Types (PT)
+ * for standard audio and video encodings" at
+ * https://www.iana.org/assignments/rtp-parameters/rtp-parameters.xhtml#rtp-parameters-1
+ */
+#define RTC_RTCP_PT_START 192
+#define RTC_RTCP_PT_END   223 
 
 /**
  * The STUN message header, which is 20 bytes long, comprises the
@@ -129,6 +148,33 @@ enum STUNAttr {
     STUN_ATTR_ICE_CONTROLLING           = 0x802A, /// ICE controlling role
 };
 
+#define OFFSET(x) offsetof(RTCContext, x)
+#define ENC AV_OPT_FLAG_ENCODING_PARAM
+#define DEC AV_OPT_FLAG_DECODING_PARAM
+const AVOption ff_rtc_options[] = {
+    { "handshake_timeout",  "Timeout in milliseconds for ICE and DTLS handshake.",      OFFSET(handshake_timeout),  AV_OPT_TYPE_INT,    { .i64 = 5000 },    -1, INT_MAX, ENC|DEC },
+    { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out", OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1200 },    -1, INT_MAX, ENC|DEC },
+    { "buffer_size",        "The buffer size, in bytes, of underlying protocol",        OFFSET(buffer_size),        AV_OPT_TYPE_INT,    { .i64 = -1 },      -1, INT_MAX, ENC|DEC },
+    { "authorization",      "The optional Bearer token for RTC Authorization",          OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC|DEC },
+    { "cert_file",          "The optional certificate file path for DTLS",              OFFSET(cert_file),          AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC|DEC },
+    { "key_file",           "The optional private key file path for DTLS",              OFFSET(key_file),           AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC|DEC },
+    { NULL },
+};
+
+/**
+ * In RTP packets, the first byte is represented as 0b10xxxxxx
+ */
+int ff_rtc_media_is_rtp_rtcp(const uint8_t *b, int size)
+{
+    return size >= RTC_RTP_HEADER_SIZE && (b[0] & 0xC0) == 0x80;
+}
+
+/* Whether the packet is RTCP. */
+int ff_rtc_media_is_rtcp(const uint8_t *b, int size)
+{
+    return size >= RTC_RTP_HEADER_SIZE && b[1] >= RTC_RTCP_PT_START && b[1] <= RTC_RTCP_PT_END;
+}  
+
 /**
  * Whether the packet is a DTLS packet.
  */
@@ -137,6 +183,38 @@ int ff_rtc_is_dtls_packet(uint8_t *b, int size) {
     return size > DTLS_RECORD_LAYER_HEADER_LEN &&
         b[0] >= DTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC &&
         (version == DTLS_VERSION_10 || version == DTLS_VERSION_12);
+}
+
+static void get_word_until_chars(char *buf, int buf_size,
+                                 const char *sep, const char **pp)
+{
+    const char *p;
+    char *q;
+
+    p = *pp;
+    p += strspn(p, SPACE_CHARS);
+    q = buf;
+    while (!strchr(sep, *p) && *p != '\0') {
+        if ((q - buf) < buf_size - 1)
+            *q++ = *p;
+        p++;
+    }
+    if (buf_size > 0)
+        *q = '\0';
+    *pp = p;
+}
+
+static void get_word_sep(char *buf, int buf_size, const char *sep,
+                         const char **pp)
+{
+    if (**pp == '/') (*pp)++;
+    get_word_until_chars(buf, buf_size, sep, pp);
+}
+
+
+static void get_word(char *buf, int buf_size, const char **pp)
+{
+    get_word_until_chars(buf, buf_size, SPACE_CHARS, pp);
 }
 
 /**
@@ -215,6 +293,14 @@ av_cold int ff_rtc_initialize(AVFormatContext *s)
     rtc->audio_first_seq = av_lfg_get(&rtc->rnd) & 0x0fff;
     rtc->video_first_seq = rtc->audio_first_seq + 1;
 
+    /* Allocate UDP buffer */
+    rtc->bufsize = MAX_UDP_BUFFER_SIZE;
+    rtc->buf = av_malloc(rtc->bufsize);
+    if (!rtc->buf) {
+        av_log(rtc, AV_LOG_ERROR, "Failed to allocate UDP buffer\n");
+        return AVERROR(ENOMEM);
+    }
+
     if (rtc->pkt_size < ideal_pkt_size)
         av_log(rtc, AV_LOG_WARNING, "pkt_size=%d(<%d) is too small, may cause packet loss\n",
                rtc->pkt_size, ideal_pkt_size);
@@ -229,14 +315,14 @@ av_cold int ff_rtc_initialize(AVFormatContext *s)
 }
 
 /**
- * Generate SDP offer according to the codec parameters, DTLS and ICE information.
+ * Generate demux SDP offer according to the codec parameters, DTLS and ICE information.
  *
  * Note that we don't use av_sdp_create to generate SDP offer because it doesn't
  * support DTLS and ICE information.
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
-static int generate_sdp_offer(AVFormatContext *s)
+static int generate_muxer_sdp_offer(AVFormatContext *s)
 {
     int ret = 0, profile_idc = 0, level, profile_iop = 0;
     const char *acodec_name = NULL, *vcodec_name = NULL;
@@ -379,6 +465,478 @@ end:
     return ret;
 }
 
+static char *generate_h264_fmtp(int profile_idc, int level_idc, int packetization_mode)
+{
+    char *fmtp;
+    int profile_level_id = (profile_idc << 16) | (level_idc & 0xFF);
+    fmtp = av_asprintf("level-asymmetry-allowed=1;packetization-mode=%d;profile-level-id=%06x",
+                       packetization_mode, profile_level_id);
+    return fmtp;
+}
+
+static char *generate_h265_fmtp(int profile_id, int tier_flag, int level_idc)
+{
+    char *fmtp;
+    fmtp = av_asprintf("profile-space=0;profile-id=%d;tier-flag=%d;level-id=%d",
+                       profile_id, tier_flag, level_idc);
+    return fmtp;
+}
+
+/**
+ * Structure to hold codec information for SDP generation
+ */
+typedef struct CodecInfo {
+    const char *enc_name;
+    enum AVCodecID codec_id;
+    int payload_type;
+    int clock_rate;
+    int channels;
+    char *fmtp;
+} CodecInfo;
+
+/**
+ * Add multiple H264 codec configurations with different profiles.
+ */
+static int add_h264_codec_variants(CodecInfo **codecs, int *codec_count, int max_codecs,
+                                    const char *enc_name, int *pt)
+{
+    struct {
+        int profile_idc;
+        int level_idc;
+    } h264_profiles[] = {
+        {AV_PROFILE_H264_BASELINE, 0x1f},           // Baseline Profile, Level 3.1
+        {AV_PROFILE_H264_MAIN, 0x1f},               // Main Profile, Level 3.1
+        {AV_PROFILE_H264_HIGH, 0x1f},               // High Profile, Level 3.1
+    };
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(h264_profiles); i++) {
+        if (*codec_count >= max_codecs)
+            break;
+
+        (*codecs)[*codec_count].enc_name = enc_name;
+        (*codecs)[*codec_count].codec_id = AV_CODEC_ID_H264;
+        (*codecs)[*codec_count].payload_type = (*pt)++;
+        (*codecs)[*codec_count].clock_rate = 90000;
+        (*codecs)[*codec_count].channels = 0;
+        (*codecs)[*codec_count].fmtp = generate_h264_fmtp(h264_profiles[i].profile_idc,
+                                                           h264_profiles[i].level_idc, 1);
+        (*codec_count)++;
+    }
+
+    return 0;
+}
+
+/**
+ * Add multiple H265/HEVC codec configurations with different profiles.
+ */
+static int add_h265_codec_variants(CodecInfo **codecs, int *codec_count, int max_codecs,
+                                    const char *enc_name, int *pt)
+{
+    struct {
+        int profile_id;
+        int tier_flag;
+        int level_idc;
+    } hevc_profiles[] = {
+        {AV_PROFILE_HEVC_MAIN, 0, 93},              // Main Profile, Main Tier, Level 3.1
+        {AV_PROFILE_HEVC_MAIN_10, 0, 93},           // Main 10 Profile, Main Tier, Level 3.1
+        {AV_PROFILE_HEVC_SCC, 0, 93},               // Screen Content Coding, Main Tier, Level 3.1
+    };
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(hevc_profiles); i++) {
+        if (*codec_count >= max_codecs)
+            break;
+
+        (*codecs)[*codec_count].enc_name = enc_name;
+        (*codecs)[*codec_count].codec_id = AV_CODEC_ID_HEVC;
+        (*codecs)[*codec_count].payload_type = (*pt)++;
+        (*codecs)[*codec_count].clock_rate = 90000;
+        (*codecs)[*codec_count].channels = 0;
+        (*codecs)[*codec_count].fmtp = generate_h265_fmtp(hevc_profiles[i].profile_id,
+                                                           hevc_profiles[i].tier_flag,
+                                                           hevc_profiles[i].level_idc);
+        (*codec_count)++;
+    }
+
+    return 0;
+}
+
+/**
+ * Get basic RTP parameters for non-H264/H265 codecs.
+ */
+static void get_basic_codec_info(enum AVCodecID codec_id, enum AVMediaType codec_type,
+                                  int *clock_rate, int *channels)
+{
+    *clock_rate = 0;
+    *channels = 0;
+
+    if (codec_type == AVMEDIA_TYPE_VIDEO) {
+        *clock_rate = 90000;
+    } else if (codec_type == AVMEDIA_TYPE_AUDIO) {
+        switch (codec_id) {
+        case AV_CODEC_ID_OPUS:
+            *clock_rate = 48000;
+            *channels = 2;
+            break;
+        case AV_CODEC_ID_PCM_MULAW:
+        case AV_CODEC_ID_PCM_ALAW:
+            *clock_rate = 8000;
+            *channels = 1;
+            break;
+        case AV_CODEC_ID_ADPCM_G722:
+            *clock_rate = 8000;
+            *channels = 1;
+            break;
+        }
+    }
+}
+
+/**
+ * Check if a codec is compatible with WebRTC/WHEP.
+ * only supports a subset of RTP codecs now.
+ */
+static int is_rtc_compatible_codec(enum AVCodecID codec_id, enum AVMediaType codec_type)
+{
+    if (codec_type == AVMEDIA_TYPE_VIDEO) {
+        switch (codec_id) {
+        case AV_CODEC_ID_VP8:
+        case AV_CODEC_ID_VP9:
+        case AV_CODEC_ID_H264:
+        case AV_CODEC_ID_AV1:
+        case AV_CODEC_ID_HEVC:
+            return 1;
+        default:
+            return 0;
+        }
+    } else if (codec_type == AVMEDIA_TYPE_AUDIO) {
+        switch (codec_id) {
+        case AV_CODEC_ID_OPUS:
+        case AV_CODEC_ID_PCM_MULAW:
+        case AV_CODEC_ID_PCM_ALAW:
+        case AV_CODEC_ID_ADPCM_G722:
+            return 1;
+        default:
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Collect all supported audio or video codecs that can be used in WHEP SDP offer.
+ */
+static int collect_supported_codecs(enum AVMediaType codec_type, CodecInfo **codec_list, int *count)
+{
+    CodecInfo *codecs = NULL;
+    int codec_count = 0;
+    int max_codecs = 100;
+    int pt = RTP_PT_PRIVATE;
+    void *opaque = NULL;
+    const RTPDynamicProtocolHandler *handler;
+    AVCodecParameters par;
+    int i;
+    int added_codecs[256] = {0};
+
+    codecs = av_mallocz(max_codecs * sizeof(CodecInfo));
+    if (!codecs)
+        return AVERROR(ENOMEM);
+
+    for (i = 0; i < RTP_PT_PRIVATE; i++) {
+        if (codec_count >= max_codecs)
+            break;
+
+        memset(&par, 0, sizeof(par));
+        if (ff_rtp_get_codec_info(&par, i) != 0) 
+            continue;
+
+        if (par.codec_type != codec_type)
+            continue;
+
+        if (par.codec_id != AV_CODEC_ID_NONE)
+            continue;
+
+        if (!is_rtc_compatible_codec(par.codec_id, codec_type))
+            continue;
+
+        if (added_codecs[par.codec_id])
+            continue;
+
+        codecs[codec_count].enc_name = ff_rtp_enc_name(i);
+        codecs[codec_count].codec_id = par.codec_id;
+        codecs[codec_count].payload_type = i;
+
+        int clock_rate, channels;
+        get_basic_codec_info(par.codec_id, codec_type, &clock_rate, &channels);
+        codecs[codec_count].clock_rate = par.sample_rate > 0 ? par.sample_rate : clock_rate;
+        codecs[codec_count].channels = par.ch_layout.nb_channels > 0 ? par.ch_layout.nb_channels : channels;
+        codecs[codec_count].fmtp = NULL;
+
+        added_codecs[par.codec_id] = 1;
+        codec_count++;
+    }
+
+    opaque = NULL;
+    while ((handler = ff_rtp_handler_iterate(&opaque))) {
+        if (codec_count >= max_codecs)
+            break;
+
+        if (handler->codec_type != codec_type)
+            continue;
+
+        if (handler->codec_id == AV_CODEC_ID_NONE)
+            continue;
+
+        if (!is_rtc_compatible_codec(handler->codec_id, codec_type))
+            continue;
+
+        if (added_codecs[handler->codec_id])
+            continue;
+
+        if (handler->codec_id == AV_CODEC_ID_H264) {
+            add_h264_codec_variants(&codecs, &codec_count, max_codecs, handler->enc_name, &pt);
+        } else if (handler->codec_id == AV_CODEC_ID_HEVC) {
+            add_h265_codec_variants(&codecs, &codec_count, max_codecs, handler->enc_name, &pt);
+        } else {
+            int payload_type = handler->static_payload_id > 0 ?
+                              handler->static_payload_id : pt++;
+
+            codecs[codec_count].enc_name = handler->enc_name;
+            codecs[codec_count].codec_id = handler->codec_id;
+            codecs[codec_count].payload_type = payload_type;
+
+            int clock_rate, channels;
+            get_basic_codec_info(handler->codec_id, codec_type, &clock_rate, &channels);
+            codecs[codec_count].clock_rate = clock_rate;
+            codecs[codec_count].channels = channels;
+            codecs[codec_count].fmtp = NULL;
+
+            codec_count++;
+        }
+        added_codecs[handler->codec_id] = 1;
+    }
+
+    *codec_list = codecs;
+    *count = codec_count;
+    return 0;
+}
+
+/**
+ * Generate demuxer SDP offer according to the codec parameters, DTLS and ICE information.
+ *
+ * Note that we don't use av_sdp_create to generate SDP offer because it doesn't
+ * support DTLS and ICE information.
+ *
+ * @return 0 if OK, AVERROR_xxx on error
+ */
+static int generate_demuxer_sdp_offer(AVFormatContext *s)
+{
+    int ret = 0, i;
+    AVBPrint bp;
+    RTCContext *rtc = s->priv_data;
+    CodecInfo *audio_codecs = NULL, *video_codecs = NULL;
+    int audio_count = 0, video_count = 0;
+
+    av_bprint_init(&bp, 1, MAX_SDP_SIZE);
+
+    if (rtc->sdp_offer) {
+        av_log(rtc, AV_LOG_ERROR, "SDP offer is already set\n");
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+
+    /* Generate SDP header */
+    av_bprintf(&bp, ""
+        "v=0\r\n"
+        "o=FFmpeg %s 2 IN IP4 %s\r\n"
+        "s=FFmpegReceiveSession\r\n"
+        "t=0 0\r\n"
+        "a=group:BUNDLE 0 1\r\n"
+        "a=extmap-allow-mixed\r\n"
+        "a=msid-semantic: WMS\r\n",
+        RTC_SDP_SESSION_ID,
+        RTC_SDP_CREATOR_IP);
+
+    snprintf(rtc->ice_ufrag_local, sizeof(rtc->ice_ufrag_local), "%08x",
+        av_lfg_get(&rtc->rnd));
+    snprintf(rtc->ice_pwd_local, sizeof(rtc->ice_pwd_local), "%08x%08x%08x%08x",
+        av_lfg_get(&rtc->rnd), av_lfg_get(&rtc->rnd), av_lfg_get(&rtc->rnd),
+        av_lfg_get(&rtc->rnd));
+
+    ret = collect_supported_codecs(AVMEDIA_TYPE_VIDEO, &video_codecs, &video_count);
+    if (ret < 0) {
+        av_log(rtc, AV_LOG_ERROR, "Failed to collect video codecs\n");
+        goto end;
+    }
+
+    ret = collect_supported_codecs(AVMEDIA_TYPE_AUDIO, &audio_codecs, &audio_count);
+    if (ret < 0) {
+        av_log(rtc, AV_LOG_ERROR, "Failed to collect audio codecs\n");
+        goto end;
+    }
+
+    if (video_count > 0) {
+        int rtx_pt_start = RTP_PT_PRIVATE + 50;
+
+        av_bprintf(&bp, "m=video 9 UDP/TLS/RTP/SAVPF");
+        for (i = 0; i < video_count; i++) {
+            av_bprintf(&bp, " %u %u", video_codecs[i].payload_type, rtx_pt_start + i);
+        }
+
+        av_bprintf(&bp, "\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=ice-ufrag:%s\r\n"
+            "a=ice-pwd:%s\r\n"
+            "a=fingerprint:sha-256 %s\r\n"
+            "a=setup:passive\r\n"
+            "a=mid:0\r\n",
+            rtc->ice_ufrag_local,
+            rtc->ice_pwd_local,
+            rtc->dtls_fingerprint);
+
+        av_bprintf(&bp,
+            "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n"
+            "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
+            // "a=extmap:5 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n"
+            "a=extmap:6 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n"
+            // "a=extmap:7 http://www.webrtc.org/experiments/rtp-hdrext/video-timing\r\n"
+            // "a=extmap:8 http://www.webrtc.org/experiments/rtp-hdrext/color-space\r\n"
+            // "a=extmap:10 http://tools.ietf.org/html/draft-ietf-avtext-framemarking-07\r\n"
+            // "a=extmap:11 http://www.webrtc.org/experiments/rtp-hdrext/video-content-type\r\n"
+            // "a=extmap:12 http://www.webrtc.org/experiments/rtp-hdrext/playout-delay\r\n"
+            // "a=extmap:14 urn:ietf:params:rtp-hdrext:toffset\r\n"
+            );
+
+        av_bprintf(&bp,
+            "a=recvonly\r\n"
+            "a=rtcp-mux\r\n"
+            "a=rtcp-rsize\r\n");
+
+        for (i = 0; i < video_count; i++) {
+            int rtx_pt = rtx_pt_start + i;
+
+            av_bprintf(&bp, "a=rtpmap:%u %s/%d\r\n",
+                video_codecs[i].payload_type,
+                video_codecs[i].enc_name,
+                video_codecs[i].clock_rate);
+
+            av_bprintf(&bp, "a=rtcp-fb:%u ccm fir\r\n", video_codecs[i].payload_type);
+            av_bprintf(&bp, "a=rtcp-fb:%u nack\r\n", video_codecs[i].payload_type);
+            av_bprintf(&bp, "a=rtcp-fb:%u nack pli\r\n", video_codecs[i].payload_type);
+            // av_bprintf(&bp, "a=rtcp-fb:%u goog-remb\r\n", video_codecs[i].payload_type);
+            // av_bprintf(&bp, "a=rtcp-fb:%u transport-cc\r\n", video_codecs[i].payload_type);
+
+            if (video_codecs[i].fmtp) {
+                av_bprintf(&bp, "a=fmtp:%u %s\r\n",
+                    video_codecs[i].payload_type,
+                    video_codecs[i].fmtp);
+            }
+
+            av_bprintf(&bp, "a=rtpmap:%u rtx/%d\r\n", rtx_pt, video_codecs[i].clock_rate);
+            av_bprintf(&bp, "a=fmtp:%u apt=%u\r\n", rtx_pt, video_codecs[i].payload_type);
+        }
+    }
+
+    if (audio_count > 0) {
+        av_bprintf(&bp, "m=audio 9 UDP/TLS/RTP/SAVPF");
+        for (i = 0; i < audio_count; i++) {
+            av_bprintf(&bp, " %u", audio_codecs[i].payload_type);
+        }
+
+        av_bprintf(&bp, "\r\n"
+            "c=IN IP4 0.0.0.0\r\n"
+            "a=ice-ufrag:%s\r\n"
+            "a=ice-pwd:%s\r\n"
+            "a=fingerprint:sha-256 %s\r\n"
+            "a=setup:passive\r\n"
+            "a=mid:1\r\n",
+            rtc->ice_ufrag_local,
+            rtc->ice_pwd_local,
+            rtc->dtls_fingerprint);
+
+        av_bprintf(&bp,
+            "a=extmap:1 urn:ietf:params:rtp-hdrext:ssrc-audio-level\r\n"
+            "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n"
+            "a=extmap:3 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n"
+            // "a=extmap:5 urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id\r\n"
+            "a=extmap:6 urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id\r\n");
+
+        av_bprintf(&bp,
+            "a=recvonly\r\n"
+            "a=rtcp-mux\r\n");
+
+        for (i = 0; i < audio_count; i++) {
+            if (audio_codecs[i].channels > 0) {
+                av_bprintf(&bp, "a=rtpmap:%u %s/%d/%d\r\n",
+                    audio_codecs[i].payload_type,
+                    audio_codecs[i].enc_name,
+                    audio_codecs[i].clock_rate,
+                    audio_codecs[i].channels);
+            } else {
+                av_bprintf(&bp, "a=rtpmap:%u %s/%d\r\n",
+                    audio_codecs[i].payload_type,
+                    audio_codecs[i].enc_name,
+                    audio_codecs[i].clock_rate);
+            }
+
+            // av_bprintf(&bp, "a=rtcp-fb:%u goog-remb\r\n", audio_codecs[i].payload_type);
+            // av_bprintf(&bp, "a=rtcp-fb:%u transport-cc\r\n", audio_codecs[i].payload_type);
+
+            if (audio_codecs[i].fmtp) {
+                av_bprintf(&bp, "a=fmtp:%u %s\r\n",
+                    audio_codecs[i].payload_type,
+                    audio_codecs[i].fmtp);
+            }
+        }
+    }
+
+    if (!av_bprint_is_complete(&bp)) {
+        av_log(rtc, AV_LOG_ERROR, "Offer exceed max %d, %s\n", MAX_SDP_SIZE, bp.str);
+        ret = AVERROR(EIO);
+        goto end;
+    }
+
+    rtc->sdp_offer = av_strdup(bp.str);
+    if (!rtc->sdp_offer) {
+        ret = AVERROR(ENOMEM);
+        goto end;
+    }
+
+    if (rtc->state < RTC_STATE_OFFER)
+        rtc->state = RTC_STATE_OFFER;
+    rtc->rtc_offer_time = av_gettime_relative();
+    av_log(rtc, AV_LOG_VERBOSE, "Generated demuxer state=%d, offer with %d audio and %d video codecs: %s\n",
+        rtc->state, audio_count, video_count, rtc->sdp_offer);
+
+end:
+    for (i = 0; i < audio_count; i++) {
+        if (audio_codecs)
+            av_freep(&audio_codecs[i].fmtp);
+    }
+    for (i = 0; i < video_count; i++) {
+        if (video_codecs)
+            av_freep(&video_codecs[i].fmtp);
+    }
+    av_freep(&audio_codecs);
+    av_freep(&video_codecs);
+    av_bprint_finalize(&bp, NULL);
+    return ret;
+}
+
+/**
+ * Generate SDP offer according to the codec parameters, DTLS and ICE information.
+ *
+ * Note that we don't use av_sdp_create to generate SDP offer because it doesn't
+ * support DTLS and ICE information.
+ *
+ * @return 0 if OK, AVERROR_xxx on error
+ */
+static int generate_sdp_offer(AVFormatContext *s) {
+    if (s->iformat) {
+        return generate_demuxer_sdp_offer(s);
+    } else {
+        return generate_muxer_sdp_offer(s);
+    }
+}
+
 /**
  * Exchange SDP offer with WebRTC peer to get the answer.
  *
@@ -503,7 +1061,7 @@ end:
  * @param s Pointer to the AVFormatContext
  * @returns Returns 0 if successful or AVERROR_xxx if an error occurs.
  */
-static int parse_answer(AVFormatContext *s)
+static int parse_answer_ice(AVFormatContext *s)
 {
     int ret = 0;
     AVIOContext *pb;
@@ -596,6 +1154,263 @@ static int parse_answer(AVFormatContext *s)
 
 end:
     avio_context_free(&pb);
+    return ret;
+}
+
+/**
+ * SDP parsing state for demuxer
+ */
+typedef struct SDPParseState {
+    RTCStreamInfo *current_stream_info;  // Current stream being parsed
+} SDPParseState;
+
+static void sdp_parse_line(AVFormatContext *s, SDPParseState *state,
+                          int letter, const char *buf)
+{
+    RTCContext *rtc = s->priv_data;
+    RTCStreamInfo *stream_info = state->current_stream_info;
+    const char *p = buf;
+    char word[256];
+
+    av_log(s, AV_LOG_TRACE, "sdp: %c='%s'\n", letter, buf);
+
+    if (!stream_info && letter != 'm')
+        return;
+
+    switch (letter) {
+    case 'm': {
+        /* m=<media> <port> <proto> <fmt> */
+        char media_type[64];
+        enum AVMediaType codec_type;
+        int payload_type;
+
+        get_word(media_type, sizeof(media_type), &p);
+        if (!strcmp(media_type, "audio")) {
+            codec_type = AVMEDIA_TYPE_AUDIO;
+        } else if (!strcmp(media_type, "video")) {
+            codec_type = AVMEDIA_TYPE_VIDEO;
+        } else {
+            state->current_stream_info = NULL;
+            return;
+        }
+
+        get_word(word, sizeof(word), &p);
+        get_word(word, sizeof(word), &p);
+        get_word(word, sizeof(word), &p); 
+        payload_type = atoi(word);
+
+        stream_info = av_mallocz(sizeof(RTCStreamInfo));
+        if (!stream_info)
+            return;
+        stream_info->payload_type = payload_type;
+        stream_info->codec_type = codec_type;
+        stream_info->codec_name = NULL;
+        stream_info->clock_rate = 0;
+        stream_info->channels = (codec_type == AVMEDIA_TYPE_AUDIO) ? 1 : 0;
+        stream_info->fmtp = NULL;
+        stream_info->direction = NULL;
+        stream_info->ssrc = 0;
+        stream_info->rtx_pt = -1;
+        stream_info->rtx_ssrc = 0;
+
+        RTCStreamInfo **new_array = av_realloc_array(rtc->stream_infos,
+                                                      rtc->nb_stream_infos + 1,
+                                                      sizeof(RTCStreamInfo*));
+        if (!new_array) {
+            av_freep(&stream_info);
+            return;
+        }
+        rtc->stream_infos = new_array;
+        rtc->stream_infos[rtc->nb_stream_infos] = stream_info;
+        rtc->nb_stream_infos++;
+        state->current_stream_info = stream_info;
+        av_log(s, AV_LOG_VERBOSE, "Parsed stream info %d: type=%s, pt=%d\n",
+               rtc->nb_stream_infos - 1, av_get_media_type_string(codec_type), payload_type);
+        break;
+    }
+    case 'a': {
+        if (av_strstart(buf, "rtpmap:", &p)) {
+            /* a=rtpmap:<payload> <codec_name>/<clock rate>[/<channels>] */
+            char codec_name[256];
+            int pt, clock_rate, channels = 1;
+
+            get_word(word, sizeof(word), &p);
+            pt = atoi(word);
+            get_word_sep(codec_name, sizeof(codec_name), "/", &p);
+            get_word_sep(word, sizeof(word), "/", &p);
+            clock_rate = atoi(word);
+            if (*p == '/') {
+                p++;
+                get_word(word, sizeof(word), &p);
+                channels = atoi(word);
+            }
+
+            if (!av_strcasecmp(codec_name, "rtx")) {
+                stream_info->rtx_pt = pt;
+                av_log(s, AV_LOG_VERBOSE, "Found RTX rtpmap: pt=%d for stream %d\n",
+                       pt, rtc->nb_stream_infos - 1);
+                break;
+            }
+
+            if (pt == stream_info->payload_type) {
+                stream_info->codec_name = av_strdup(codec_name);
+                stream_info->clock_rate = clock_rate;
+
+                if (stream_info->codec_type == AVMEDIA_TYPE_AUDIO) {
+                    stream_info->channels = channels;
+                }
+                av_log(s, AV_LOG_VERBOSE, "Parsed main stream rtpmap: type=%s, codec=%s, pt=%d, rate=%d\n",
+                       av_get_media_type_string(stream_info->codec_type), codec_name, pt, clock_rate);
+            }
+
+        } else if (av_strstart(buf, "fmtp:", &p)) {
+            /* a=fmtp:<payload> <parameters> */
+            int pt;
+
+            get_word(word, sizeof(word), &p);
+            pt = atoi(word);
+            if (pt == stream_info->payload_type) {
+                stream_info->fmtp = av_strdup(p);
+                av_log(s, AV_LOG_VERBOSE, "Stored fmtp for stream info %d: %s\n",
+                       rtc->nb_stream_infos - 1, p);
+            }
+
+        } else if (av_strstart(buf, "ssrc-group:FID ", &p)) {
+            /* a=ssrc-group:FID <ssrc> <rtx_ssrc> */
+            uint32_t ssrc, rtx_ssrc;
+
+            get_word(word, sizeof(word), &p);
+            ssrc = strtoul(word, NULL, 10);
+            get_word(word, sizeof(word), &p);
+            rtx_ssrc = strtoul(word, NULL, 10);
+            stream_info->ssrc = ssrc;
+            stream_info->rtx_ssrc = rtx_ssrc;
+            av_log(s, AV_LOG_VERBOSE, "Stream info %d: ssrc-group FID %u, rtx=%u\n",
+                   rtc->nb_stream_infos - 1, ssrc, rtx_ssrc);
+
+        } else if (av_strstart(buf, "ssrc:", &p)) {
+            /* a=ssrc:<ssrc> [...] */
+            uint32_t ssrc;
+
+            get_word(word, sizeof(word), &p);
+            ssrc = strtoul(word, NULL, 10);
+            if (stream_info->ssrc == 0) {
+                stream_info->ssrc = ssrc;
+                av_log(s, AV_LOG_VERBOSE, "Stream info %d: main ssrc=%u\n",
+                       rtc->nb_stream_infos - 1, ssrc);
+            }
+        } else if (!strcmp(buf, "sendrecv") || !strcmp(buf, "sendonly") ||
+                   !strcmp(buf, "recvonly") || !strcmp(buf, "inactive")) {
+            /* direction */
+            /* a=sendrecv / a=sendonly / a=recvonly / a=inactive */
+            av_freep(&stream_info->direction);
+            stream_info->direction = av_strdup(buf);
+            av_log(s, AV_LOG_VERBOSE, "Stream info %d: direction=%s\n",
+                   rtc->nb_stream_infos - 1, buf);
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+/**
+ * Parse media information from SDP answer for demuxer.
+ */
+static int parse_answer_media(AVFormatContext *s)
+{
+    int ret = 0;
+    RTCContext *rtc = s->priv_data;
+    const char *p;
+    int letter;
+    char line[MAX_URL_SIZE], *q;
+    SDPParseState state = {0};
+
+    if (!rtc->sdp_answer || !strlen(rtc->sdp_answer)) {
+        av_log(rtc, AV_LOG_ERROR, "No answer to parse for media\n");
+        return AVERROR(EINVAL);
+    }
+
+    rtc->stream_infos = NULL;
+    rtc->nb_stream_infos = 0;
+
+    p = rtc->sdp_answer;
+    for (;;) {
+        p += strspn(p, SPACE_CHARS);
+        letter = *p;
+        if (letter == '\0')
+            break;
+        p++;
+        if (*p != '=')
+            goto next_line;
+        p++;
+        /* get the content */
+        q = line;
+        while (*p != '\n' && *p != '\r' && *p != '\0') {
+            if ((q - line) < sizeof(line) - 1)
+                *q++ = *p;
+            p++;
+        }
+        *q = '\0';
+        sdp_parse_line(s, &state, letter, line);
+    next_line:
+        while (*p != '\n' && *p != '\0')
+            p++;
+        if (*p == '\n')
+            p++;
+    }
+
+    if (rtc->nb_stream_infos == 0) {
+        av_log(rtc, AV_LOG_ERROR, "No valid media streams found in answer\n");
+        ret = AVERROR(EINVAL);
+        goto end;
+    }
+
+    av_log(rtc, AV_LOG_VERBOSE, "Parsed %d media stream infos from SDP answer\n", rtc->nb_stream_infos);
+
+    /* Log RTX information for each stream */
+    for (int i = 0; i < rtc->nb_stream_infos; i++) {
+        RTCStreamInfo *stream_info = rtc->stream_infos[i];
+        if (stream_info && stream_info->rtx_pt >= 0) {
+            av_log(s, AV_LOG_INFO, "Stream info %d has RTX: pt=%d, rtx_ssrc=%u\n",
+                   i, stream_info->rtx_pt, stream_info->rtx_ssrc);
+        }
+    }
+
+end:
+    if (ret < 0) {
+        /* Clean up on error */
+        for (int i = 0; i < rtc->nb_stream_infos; i++) {
+            if (rtc->stream_infos[i]) {
+                av_freep(&rtc->stream_infos[i]->codec_name);
+                av_freep(&rtc->stream_infos[i]->fmtp);
+                av_freep(&rtc->stream_infos[i]->direction);
+                av_freep(&rtc->stream_infos[i]);
+            }
+        }
+        av_freep(&rtc->stream_infos);
+        rtc->nb_stream_infos = 0;
+    }
+    return ret;
+}
+
+static int parse_answer(AVFormatContext *s)
+{
+    int ret;
+
+    RTCContext *rtc = s->priv_data;
+    av_log(rtc, AV_LOG_VERBOSE, "answer:\r\n%s\r\n",rtc->sdp_answer);
+
+    //demuxer need parse media
+    if (s->iformat) {
+        if ((ret = parse_answer_media(s)) < 0)
+            return ret;
+    }
+
+    if ((ret = parse_answer_ice(s)) < 0)
+        return ret;
+
     return ret;
 }
 
@@ -812,7 +1627,7 @@ static int ice_handle_binding_request(AVFormatContext *s, char *buf, int buf_siz
     memcpy(tid, buf + 8, 12);
 
     /* Build the STUN binding response. */
-    ret = ice_create_response(s, tid, sizeof(tid), rtc->buf, sizeof(rtc->buf), &size);
+    ret = ice_create_response(s, tid, sizeof(tid), rtc->buf, rtc->bufsize, &size);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding response, size=%d\n", size);
         return ret;
@@ -886,7 +1701,7 @@ static int ice_dtls_handshake(AVFormatContext *s)
     while (1) {
         if (rtc->state <= RTC_STATE_ICE_CONNECTING) {
             /* Build the STUN binding request. */
-            ret = ff_rtc_ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
+            ret = ff_rtc_ice_create_request(s, rtc->buf, rtc->bufsize, &size);
             if (ret < 0) {
                 av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
                 goto end;
@@ -919,7 +1734,7 @@ next_packet:
         for (i = 0; i < ICE_DTLS_READ_MAX_RETRY; i++) {
             if (rtc->state > RTC_STATE_ICE_CONNECTED)
                 break;
-            ret = ffurl_read(rtc->udp, rtc->buf, sizeof(rtc->buf));
+            ret = ffurl_read(rtc->udp, rtc->buf, rtc->bufsize);
             if (ret > 0)
                 break;
             if (ret == AVERROR(EAGAIN)) {
@@ -1015,13 +1830,12 @@ static int setup_srtp(AVFormatContext *s)
     int ret;
     char recv_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
     char send_key[DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN];
-    char buf[AV_BASE64_SIZE(DTLS_SRTP_KEY_LEN + DTLS_SRTP_SALT_LEN)];
+    RTCContext *rtc = s->priv_data;
     /**
      * The profile for OpenSSL's SRTP is SRTP_AES128_CM_SHA1_80, see ssl/d1_srtp.c.
      * The profile for FFmpeg's SRTP is SRTP_AES128_CM_HMAC_SHA1_80, see libavformat/srtp.c.
      */
-    const char* suite = "SRTP_AES128_CM_HMAC_SHA1_80";
-    RTCContext *rtc = s->priv_data;
+    av_strlcpy(rtc->suite, "SRTP_AES128_CM_HMAC_SHA1_80", sizeof(rtc->suite));
     ret = ff_dtls_export_materials(rtc->dtls_uc, rtc->dtls_srtp_materials, sizeof(rtc->dtls_srtp_materials));
     if (ret < 0)
         goto end;
@@ -1045,44 +1859,44 @@ static int setup_srtp(AVFormatContext *s)
     memcpy(send_key + DTLS_SRTP_KEY_LEN, server_salt, DTLS_SRTP_SALT_LEN);
 
     /* Setup SRTP context for outgoing packets */
-    if (!av_base64_encode(buf, sizeof(buf), send_key, sizeof(send_key))) {
+    if (!av_base64_encode(rtc->send_suite_param, sizeof(rtc->send_suite_param), send_key, sizeof(send_key))) {
         av_log(rtc, AV_LOG_ERROR, "Failed to encode send key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
-    ret = ff_srtp_set_crypto(&rtc->srtp_audio_send, suite, buf);
+    ret = ff_srtp_set_crypto(&rtc->srtp_audio_send, rtc->suite, rtc->send_suite_param);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for audio send\n");
         goto end;
     }
 
-    ret = ff_srtp_set_crypto(&rtc->srtp_video_send, suite, buf);
+    ret = ff_srtp_set_crypto(&rtc->srtp_video_send, rtc->suite, rtc->send_suite_param);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for video send\n");
         goto end;
     }
 
-    ret = ff_srtp_set_crypto(&rtc->srtp_video_rtx_send, suite, buf);
+    ret = ff_srtp_set_crypto(&rtc->srtp_video_rtx_send, rtc->suite, rtc->send_suite_param);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for video rtx send\n");
         goto end;
     }
 
-    ret = ff_srtp_set_crypto(&rtc->srtp_rtcp_send, suite, buf);
+    ret = ff_srtp_set_crypto(&rtc->srtp_rtcp_send, rtc->suite, rtc->send_suite_param);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for rtcp send\n");
         goto end;
     }
 
     /* Setup SRTP context for incoming packets */
-    if (!av_base64_encode(buf, sizeof(buf), recv_key, sizeof(recv_key))) {
+    if (!av_base64_encode(rtc->recv_suite_param, sizeof(rtc->recv_suite_param), recv_key, sizeof(recv_key))) {
         av_log(rtc, AV_LOG_ERROR, "Failed to encode recv key\n");
         ret = AVERROR(EIO);
         goto end;
     }
 
-    ret = ff_srtp_set_crypto(&rtc->srtp_recv, suite, buf);
+    ret = ff_srtp_set_crypto(&rtc->srtp_recv, rtc->suite, rtc->recv_suite_param);
     if (ret < 0) {
         av_log(rtc, AV_LOG_ERROR, "Failed to set crypto for recv\n");
         goto end;
@@ -1092,7 +1906,7 @@ static int setup_srtp(AVFormatContext *s)
         rtc->state = RTC_STATE_SRTP_FINISHED;
     rtc->rtc_srtp_time = av_gettime_relative();
     av_log(rtc, AV_LOG_VERBOSE, "SRTP setup done, state=%d, suite=%s, key=%zuB, elapsed=%.2fms\n",
-        rtc->state, suite, sizeof(send_key), ELAPSED(rtc->rtc_starttime, av_gettime_relative()));
+        rtc->state, rtc->suite, sizeof(send_key), ELAPSED(rtc->rtc_starttime, av_gettime_relative()));
 
 end:
     return ret;
@@ -1158,6 +1972,7 @@ end:
 
 int ff_rtc_connect(AVFormatContext *s) {
     int ret = 0;
+
     if ((ret = generate_sdp_offer(s)) < 0)
         goto end;
 
@@ -1206,6 +2021,21 @@ void ff_rtc_close(AVFormatContext *s)
         s->streams[i]->priv_data = NULL;
     }
 
+    /* Free parsed stream info array (for demuxer) */
+    if (rtc->stream_infos) {
+        for (i = 0; i < rtc->nb_stream_infos; i++) {
+            if (rtc->stream_infos[i]) {
+                av_freep(&rtc->stream_infos[i]->codec_name);
+                av_freep(&rtc->stream_infos[i]->fmtp);
+                av_freep(&rtc->stream_infos[i]->direction);
+                av_freep(&rtc->stream_infos[i]);
+            }
+        }
+        av_freep(&rtc->stream_infos);
+        rtc->nb_stream_infos = 0;
+    }
+
+    av_freep(&rtc->buf);
     av_freep(&rtc->sdp_offer);
     av_freep(&rtc->sdp_answer);
     av_freep(&rtc->rtc_resource_url);
@@ -1225,14 +2055,3 @@ void ff_rtc_close(AVFormatContext *s)
     ffurl_closep(&rtc->udp);
 }
 
-#define OFFSET(x) offsetof(RTCContext, x)
-#define ENC AV_OPT_FLAG_ENCODING_PARAM
-const AVOption ff_rtc_options[] = {
-    { "handshake_timeout",  "Timeout in milliseconds for ICE and DTLS handshake.",      OFFSET(handshake_timeout),  AV_OPT_TYPE_INT,    { .i64 = 5000 },    -1, INT_MAX, ENC },
-    { "pkt_size",           "The maximum size, in bytes, of RTP packets that send out", OFFSET(pkt_size),           AV_OPT_TYPE_INT,    { .i64 = 1200 },    -1, INT_MAX, ENC },
-    { "buffer_size",        "The buffer size, in bytes, of underlying protocol",        OFFSET(buffer_size),        AV_OPT_TYPE_INT,    { .i64 = -1 },      -1, INT_MAX, ENC },
-    { "authorization",      "The optional Bearer token for WHIP Authorization",         OFFSET(authorization),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
-    { "cert_file",          "The optional certificate file path for DTLS",              OFFSET(cert_file),          AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
-    { "key_file",           "The optional private key file path for DTLS",              OFFSET(key_file),      AV_OPT_TYPE_STRING, { .str = NULL },     0,       0, ENC },
-    { NULL },
-};
