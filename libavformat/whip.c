@@ -115,7 +115,7 @@ static int parse_profile_level(AVFormatContext *s, AVCodecParameters *par)
     const uint8_t *r = par->extradata, *r1, *end = par->extradata + par->extradata_size;
     H264SPS seq, *const sps = &seq;
     uint32_t state;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
 
     if (par->codec_id != AV_CODEC_ID_H264)
         return ret;
@@ -124,7 +124,7 @@ static int parse_profile_level(AVFormatContext *s, AVCodecParameters *par)
         return ret;
 
     if (!par->extradata || par->extradata_size <= 0) {
-        av_log(whip, AV_LOG_ERROR, "Unable to parse profile from empty extradata=%p, size=%d\n",
+        av_log(rtc, AV_LOG_ERROR, "Unable to parse profile from empty extradata=%p, size=%d\n",
             par->extradata, par->extradata_size);
         return AVERROR(EINVAL);
     }
@@ -138,12 +138,12 @@ static int parse_profile_level(AVFormatContext *s, AVCodecParameters *par)
         if ((state & 0x1f) == H264_NAL_SPS) {
             ret = ff_avc_decode_sps(sps, r, r1 - r);
             if (ret < 0) {
-                av_log(whip, AV_LOG_ERROR, "Failed to decode SPS, state=%x, size=%d\n",
+                av_log(rtc, AV_LOG_ERROR, "Failed to decode SPS, state=%x, size=%d\n",
                     state, (int)(r1 - r));
                 return ret;
             }
 
-            av_log(whip, AV_LOG_VERBOSE, "Parse profile=%d, level=%d from SPS\n",
+            av_log(rtc, AV_LOG_VERBOSE, "Parse profile=%d, level=%d from SPS\n",
                 sps->profile_idc, sps->level_idc);
             par->profile = sps->profile_idc;
             par->level = sps->level_idc;
@@ -179,70 +179,70 @@ static int parse_profile_level(AVFormatContext *s, AVCodecParameters *par)
 static int parse_codec(AVFormatContext *s)
 {
     int i, ret = 0;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
 
     for (i = 0; i < s->nb_streams; i++) {
         AVCodecParameters *par = s->streams[i]->codecpar;
         const AVCodecDescriptor *desc = avcodec_descriptor_get(par->codec_id);
         switch (par->codec_type) {
         case AVMEDIA_TYPE_VIDEO:
-            if (whip->video_par) {
-                av_log(whip, AV_LOG_ERROR, "Only one video stream is supported by RTC\n");
+            if (rtc->video_par) {
+                av_log(rtc, AV_LOG_ERROR, "Only one video stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
-            whip->video_par = par;
+            rtc->video_par = par;
 
             if (par->codec_id != AV_CODEC_ID_H264) {
-                av_log(whip, AV_LOG_ERROR, "Unsupported video codec %s by RTC, choose h264\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported video codec %s by RTC, choose h264\n",
                        desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->video_delay > 0) {
-                av_log(whip, AV_LOG_ERROR, "Unsupported B frames by RTC\n");
+                av_log(rtc, AV_LOG_ERROR, "Unsupported B frames by RTC\n");
                 return AVERROR_PATCHWELCOME;
             }
 
             if ((ret = parse_profile_level(s, par)) < 0) {
-                av_log(whip, AV_LOG_ERROR, "Failed to parse SPS/PPS from extradata\n");
+                av_log(rtc, AV_LOG_ERROR, "Failed to parse SPS/PPS from extradata\n");
                 return AVERROR(EINVAL);
             }
 
             if (par->profile == AV_PROFILE_UNKNOWN) {
-                av_log(whip, AV_LOG_WARNING, "No profile found in extradata, consider baseline\n");
+                av_log(rtc, AV_LOG_WARNING, "No profile found in extradata, consider baseline\n");
                 return AVERROR(EINVAL);
             }
             if (par->level == AV_LEVEL_UNKNOWN) {
-                av_log(whip, AV_LOG_WARNING, "No level found in extradata, consider 3.1\n");
+                av_log(rtc, AV_LOG_WARNING, "No level found in extradata, consider 3.1\n");
                 return AVERROR(EINVAL);
             }
             break;
         case AVMEDIA_TYPE_AUDIO:
-            if (whip->audio_par) {
-                av_log(whip, AV_LOG_ERROR, "Only one audio stream is supported by RTC\n");
+            if (rtc->audio_par) {
+                av_log(rtc, AV_LOG_ERROR, "Only one audio stream is supported by RTC\n");
                 return AVERROR(EINVAL);
             }
-            whip->audio_par = par;
+            rtc->audio_par = par;
 
             if (par->codec_id != AV_CODEC_ID_OPUS) {
-                av_log(whip, AV_LOG_ERROR, "Unsupported audio codec %s by RTC, choose opus\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio codec %s by RTC, choose opus\n",
                     desc ? desc->name : "unknown");
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->ch_layout.nb_channels != 2) {
-                av_log(whip, AV_LOG_ERROR, "Unsupported audio channels %d by RTC, choose stereo\n",
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio channels %d by RTC, choose stereo\n",
                     par->ch_layout.nb_channels);
                 return AVERROR_PATCHWELCOME;
             }
 
             if (par->sample_rate != 48000) {
-                av_log(whip, AV_LOG_ERROR, "Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
+                av_log(rtc, AV_LOG_ERROR, "Unsupported audio sample rate %d by RTC, choose 48000\n", par->sample_rate);
                 return AVERROR_PATCHWELCOME;
             }
             break;
         default:
-            av_log(whip, AV_LOG_ERROR, "Codec type '%s' for stream %d is not supported by RTC\n",
+            av_log(rtc, AV_LOG_ERROR, "Codec type '%s' for stream %d is not supported by RTC\n",
                    av_get_media_type_string(par->codec_type), i);
             return AVERROR_PATCHWELCOME;
         }
@@ -264,7 +264,7 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
     int ret, cipher_size, is_rtcp, is_video;
     uint8_t payload_type;
     AVFormatContext *s = opaque;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
     SRTPContext *srtp;
 
     /* Ignore if not RTP or RTCP packet. */
@@ -274,23 +274,23 @@ static int on_rtp_write_packet(void *opaque, const uint8_t *buf, int buf_size)
     /* Only support audio, video and rtcp. */
     is_rtcp = media_is_rtcp(buf, buf_size);
     payload_type = buf[1] & 0x7f;
-    is_video = payload_type == whip->video_payload_type;
-    if (!is_rtcp && payload_type != whip->video_payload_type && payload_type != whip->audio_payload_type)
+    is_video = payload_type == rtc->video_payload_type;
+    if (!is_rtcp && payload_type != rtc->video_payload_type && payload_type != rtc->audio_payload_type)
         return 0;
 
     /* Get the corresponding SRTP context. */
-    srtp = is_rtcp ? &whip->srtp_rtcp_send : (is_video? &whip->srtp_video_send : &whip->srtp_audio_send);
+    srtp = is_rtcp ? &rtc->srtp_rtcp_send : (is_video? &rtc->srtp_video_send : &rtc->srtp_audio_send);
 
     /* Encrypt by SRTP and send out. */
-    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, whip->buf, sizeof(whip->buf));
+    cipher_size = ff_srtp_encrypt(srtp, buf, buf_size, rtc->buf, sizeof(rtc->buf));
     if (cipher_size <= 0 || cipher_size < buf_size) {
-        av_log(whip, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
+        av_log(rtc, AV_LOG_WARNING, "Failed to encrypt packet=%dB, cipher=%dB\n", buf_size, cipher_size);
         return 0;
     }
 
-    ret = ffurl_write(whip->udp, whip->buf, cipher_size);
+    ret = ffurl_write(rtc->udp, rtc->buf, cipher_size);
     if (ret < 0) {
-        av_log(whip, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
+        av_log(rtc, AV_LOG_ERROR, "Failed to write packet=%dB, ret=%d\n", cipher_size, ret);
         return ret;
     }
 
@@ -315,12 +315,12 @@ static int create_rtp_muxer(AVFormatContext *s)
     AVDictionary *opts = NULL;
     uint8_t *buffer = NULL;
     char buf[64];
-    WHIPContext *whip = s->priv_data;
-    whip->udp->flags |= AVIO_FLAG_NONBLOCK;
+    RTCContext *rtc = s->priv_data;
+    rtc->udp->flags |= AVIO_FLAG_NONBLOCK;
 
     const AVOutputFormat *rtp_format = av_guess_format("rtp", NULL, NULL);
     if (!rtp_format) {
-        av_log(whip, AV_LOG_ERROR, "Failed to guess rtp muxer\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to guess rtp muxer\n");
         ret = AVERROR(ENOSYS);
         goto end;
     }
@@ -328,7 +328,7 @@ static int create_rtp_muxer(AVFormatContext *s)
     /* The UDP buffer size, may greater than MTU. */
     buffer_size = MAX_UDP_BUFFER_SIZE;
     /* The RTP payload max size. Reserved some bytes for SRTP checksum and padding. */
-    max_packet_size = whip->pkt_size - DTLS_SRTP_CHECKSUM_LEN;
+    max_packet_size = rtc->pkt_size - DTLS_SRTP_CHECKSUM_LEN;
 
     for (i = 0; i < s->nb_streams; i++) {
         rtp_ctx = avformat_alloc_context();
@@ -381,15 +381,15 @@ static int create_rtp_muxer(AVFormatContext *s)
         rtp_ctx->pb->av_class = &ff_avio_class;
 
         is_video = s->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO;
-        snprintf(buf, sizeof(buf), "%d", is_video? whip->video_payload_type : whip->audio_payload_type);
+        snprintf(buf, sizeof(buf), "%d", is_video? rtc->video_payload_type : rtc->audio_payload_type);
         av_dict_set(&opts, "payload_type", buf, 0);
-        snprintf(buf, sizeof(buf), "%d", is_video? whip->video_ssrc : whip->audio_ssrc);
+        snprintf(buf, sizeof(buf), "%d", is_video? rtc->video_ssrc : rtc->audio_ssrc);
         av_dict_set(&opts, "ssrc", buf, 0);
-        av_dict_set_int(&opts, "seq", is_video ? whip->video_first_seq : whip->audio_first_seq, 0);
+        av_dict_set_int(&opts, "seq", is_video ? rtc->video_first_seq : rtc->audio_first_seq, 0);
 
         ret = avformat_write_header(rtp_ctx, &opts);
         if (ret < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to write rtp header\n");
+            av_log(rtc, AV_LOG_ERROR, "Failed to write rtp header\n");
             goto end;
         }
 
@@ -399,18 +399,18 @@ static int create_rtp_muxer(AVFormatContext *s)
         rtp_ctx = NULL;
     }
 
-    if (whip->state < WHIP_STATE_READY)
-        whip->state = WHIP_STATE_READY;
-    av_log(whip, AV_LOG_INFO, "Muxer state=%d, buffer_size=%d, max_packet_size=%d, "
+    if (rtc->state < RTC_STATE_READY)
+        rtc->state = RTC_STATE_READY;
+    av_log(rtc, AV_LOG_INFO, "Muxer state=%d, buffer_size=%d, max_packet_size=%d, "
                            "elapsed=%.2fms(init:%.2f,offer:%.2f,answer:%.2f,udp:%.2f,ice:%.2f,dtls:%.2f,srtp:%.2f)\n",
-        whip->state, buffer_size, max_packet_size, ELAPSED(whip->whip_starttime, av_gettime_relative()),
-        ELAPSED(whip->whip_starttime,   whip->whip_init_time),
-        ELAPSED(whip->whip_init_time,   whip->whip_offer_time),
-        ELAPSED(whip->whip_offer_time,  whip->whip_answer_time),
-        ELAPSED(whip->whip_answer_time, whip->whip_udp_time),
-        ELAPSED(whip->whip_udp_time,    whip->whip_ice_time),
-        ELAPSED(whip->whip_ice_time,    whip->whip_dtls_time),
-        ELAPSED(whip->whip_dtls_time,   whip->whip_srtp_time));
+        rtc->state, buffer_size, max_packet_size, ELAPSED(rtc->rtc_starttime, av_gettime_relative()),
+        ELAPSED(rtc->rtc_starttime,   rtc->rtc_init_time),
+        ELAPSED(rtc->rtc_init_time,   rtc->rtc_offer_time),
+        ELAPSED(rtc->rtc_offer_time,  rtc->rtc_answer_time),
+        ELAPSED(rtc->rtc_answer_time, rtc->rtc_udp_time),
+        ELAPSED(rtc->rtc_udp_time,    rtc->rtc_ice_time),
+        ELAPSED(rtc->rtc_ice_time,    rtc->rtc_dtls_time),
+        ELAPSED(rtc->rtc_dtls_time,   rtc->rtc_srtp_time));
 
 end:
     if (rtp_ctx)
@@ -504,7 +504,7 @@ fail:
 static av_cold int whip_init(AVFormatContext *s)
 {
     int ret;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
 
     if ((ret = ff_rtc_initialize(s)) < 0)
         goto end;
@@ -520,14 +520,14 @@ static av_cold int whip_init(AVFormatContext *s)
 
 end:
     if (ret < 0)
-        whip->state = WHIP_STATE_FAILED;
+        rtc->state = RTC_STATE_FAILED;
     return ret;
 }
 
 static void handle_nack_rtx(AVFormatContext *s, int size)
 {
     int ret;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
     uint8_t *buf = NULL;
     int rtcp_len, srtcp_len, header_len = 12/*RFC 4585 6.1*/;
 
@@ -536,27 +536,27 @@ static void handle_nack_rtx(AVFormatContext *s, int size)
      * The length of this RTCP packet in 32 bit words minus one,
      * including the header and any padding.
      */
-    rtcp_len = (AV_RB16(&whip->buf[2]) + 1) * 4;
+    rtcp_len = (AV_RB16(&rtc->buf[2]) + 1) * 4;
     if (rtcp_len <= header_len) {
-        av_log(whip, AV_LOG_WARNING, "NACK packet is broken, size: %d\n", rtcp_len);
+        av_log(rtc, AV_LOG_WARNING, "NACK packet is broken, size: %d\n", rtcp_len);
         goto error;
     }
     /* SRTCP index(4 bytes) + HMAC(SRTP_ARS128_CM_SHA1_80) 10bytes */
     srtcp_len = rtcp_len + 4 + 10;
     if (srtcp_len != size) {
-        av_log(whip, AV_LOG_WARNING, "NACK packet size not match, srtcp_len:%d, size:%d\n", srtcp_len, size);
+        av_log(rtc, AV_LOG_WARNING, "NACK packet size not match, srtcp_len:%d, size:%d\n", srtcp_len, size);
         goto error;
     }
-    buf = av_memdup(whip->buf, srtcp_len);
+    buf = av_memdup(rtc->buf, srtcp_len);
     if (!buf)
         goto error;
-    if ((ret = ff_srtp_decrypt(&whip->srtp_recv, buf, &srtcp_len)) < 0) {
-        av_log(whip, AV_LOG_WARNING, "NACK packet decrypt failed: %d\n", ret);
+    if ((ret = ff_srtp_decrypt(&rtc->srtp_recv, buf, &srtcp_len)) < 0) {
+        av_log(rtc, AV_LOG_WARNING, "NACK packet decrypt failed: %d\n", ret);
         goto error;
     }
     goto end;
 error:
-    av_log(whip, AV_LOG_WARNING, "Failed to handle NACK and RTX, Skip...\n");
+    av_log(rtc, AV_LOG_WARNING, "Failed to handle NACK and RTX, Skip...\n");
 end:
     av_freep(&buf);
 }
@@ -564,7 +564,7 @@ end:
 static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     int ret;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
     AVStream *st = s->streams[pkt->stream_index];
     AVFormatContext *rtp_ctx = st->priv_data;
 
@@ -573,52 +573,52 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
      * Refer to RFC 7675
      * Periodically send Consent Freshness STUN Binding Request
      */
-    if (now - whip->whip_last_consent_tx_time > WHIP_ICE_CONSENT_CHECK_INTERVAL * WHIP_US_PER_MS) {
+    if (now - rtc->rtc_last_consent_tx_time > WHIP_ICE_CONSENT_CHECK_INTERVAL * RTC_US_PER_MS) {
         int size;
-        ret = ff_rtc_ice_create_request(s, whip->buf, sizeof(whip->buf), &size);
+        ret = ff_rtc_ice_create_request(s, rtc->buf, sizeof(rtc->buf), &size);
         if (ret < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
+            av_log(rtc, AV_LOG_ERROR, "Failed to create STUN binding request, size=%d\n", size);
             goto end;
         }
-        ret = ffurl_write(whip->udp, whip->buf, size);
+        ret = ffurl_write(rtc->udp, rtc->buf, size);
         if (ret < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
+            av_log(rtc, AV_LOG_ERROR, "Failed to send STUN binding request, size=%d\n", size);
             goto end;
         }
-        whip->whip_last_consent_tx_time = now;
-        av_log(whip, AV_LOG_DEBUG, "Consent Freshness check sent\n");
+        rtc->rtc_last_consent_tx_time = now;
+        av_log(rtc, AV_LOG_DEBUG, "Consent Freshness check sent\n");
     }
 
     /**
      * Receive packets from the server such as ICE binding requests, DTLS messages,
      * and RTCP like PLI requests, then respond to them.
      */
-    ret = ffurl_read(whip->udp, whip->buf, sizeof(whip->buf));
+    ret = ffurl_read(rtc->udp, rtc->buf, sizeof(rtc->buf));
     if (ret < 0) {
         if (ret == AVERROR(EAGAIN))
             goto write_packet;
-        av_log(whip, AV_LOG_ERROR, "Failed to read from UDP socket\n");
+        av_log(rtc, AV_LOG_ERROR, "Failed to read from UDP socket\n");
         goto end;
     }
     if (!ret) {
-        av_log(whip, AV_LOG_ERROR, "Receive EOF from UDP socket\n");
+        av_log(rtc, AV_LOG_ERROR, "Receive EOF from UDP socket\n");
         goto end;
     }
 
-    if (ff_rtc_ice_is_binding_response(whip->buf, ret)) {
-        whip->whip_last_consent_rx_time = av_gettime_relative();
-        av_log(whip, AV_LOG_DEBUG, "Consent Freshness check received\n");
+    if (ff_rtc_ice_is_binding_response(rtc->buf, ret)) {
+        rtc->rtc_last_consent_rx_time = av_gettime_relative();
+        av_log(rtc, AV_LOG_DEBUG, "Consent Freshness check received\n");
     }
 
-    if (ff_rtc_is_dtls_packet(whip->buf, ret)) {
-        if ((ret = ffurl_write(whip->dtls_uc, whip->buf, ret)) < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to handle DTLS message\n");
+    if (ff_rtc_is_dtls_packet(rtc->buf, ret)) {
+        if ((ret = ffurl_write(rtc->dtls_uc, rtc->buf, ret)) < 0) {
+            av_log(rtc, AV_LOG_ERROR, "Failed to handle DTLS message\n");
             goto end;
         }
     }
-    if (media_is_rtcp(whip->buf, ret)) {
-        uint8_t fmt = whip->buf[0] & 0x1f;
-        uint8_t pt = whip->buf[1];
+    if (media_is_rtcp(rtc->buf, ret)) {
+        uint8_t fmt = rtc->buf[0] & 0x1f;
+        uint8_t pt = rtc->buf[1];
         /**
          * Handle RTCP NACK packet
          * Refer to RFC 4585 6.2.1
@@ -631,17 +631,17 @@ static int whip_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 write_packet:
     now = av_gettime_relative();
-    if (now - whip->whip_last_consent_rx_time > WHIP_ICE_CONSENT_EXPIRED_TIMER * WHIP_US_PER_MS) {
-        av_log(whip, AV_LOG_ERROR,
+    if (now - rtc->rtc_last_consent_rx_time > WHIP_ICE_CONSENT_EXPIRED_TIMER * RTC_US_PER_MS) {
+        av_log(rtc, AV_LOG_ERROR,
             "Consent Freshness expired after %.2fms (limited %dms), terminate session\n",
-            ELAPSED(now, whip->whip_last_consent_rx_time), WHIP_ICE_CONSENT_EXPIRED_TIMER);
+            ELAPSED(now, rtc->rtc_last_consent_rx_time), WHIP_ICE_CONSENT_EXPIRED_TIMER);
         ret = AVERROR(ETIMEDOUT);
         goto end;
     }
 
-    if (whip->h264_annexb_insert_sps_pps && st->codecpar->codec_id == AV_CODEC_ID_H264) {
+    if (rtc->h264_annexb_insert_sps_pps && st->codecpar->codec_id == AV_CODEC_ID_H264) {
         if ((ret = h264_annexb_insert_sps_pps(s, pkt)) < 0) {
-            av_log(whip, AV_LOG_ERROR, "Failed to insert SPS/PPS before IDR\n");
+            av_log(rtc, AV_LOG_ERROR, "Failed to insert SPS/PPS before IDR\n");
             goto end;
         }
     }
@@ -649,18 +649,18 @@ write_packet:
     ret = ff_write_chained(rtp_ctx, 0, pkt, s, 0);
     if (ret < 0) {
         if (ret == AVERROR(EINVAL)) {
-            av_log(whip, AV_LOG_WARNING, "Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
+            av_log(rtc, AV_LOG_WARNING, "Ignore failed to write packet=%dB, ret=%d\n", pkt->size, ret);
             ret = 0;
         } else if (ret == AVERROR(EAGAIN)) {
-            av_log(whip, AV_LOG_ERROR, "UDP send blocked, please increase the buffer via -buffer_size\n");
+            av_log(rtc, AV_LOG_ERROR, "UDP send blocked, please increase the buffer via -buffer_size\n");
         } else
-            av_log(whip, AV_LOG_ERROR, "Failed to write packet, size=%d, ret=%d\n", pkt->size, ret);
+            av_log(rtc, AV_LOG_ERROR, "Failed to write packet, size=%d, ret=%d\n", pkt->size, ret);
         goto end;
     }
 
 end:
     if (ret < 0)
-        whip->state = WHIP_STATE_FAILED;
+        rtc->state = RTC_STATE_FAILED;
     return ret;
 }
 
@@ -673,16 +673,16 @@ static int whip_check_bitstream(AVFormatContext *s, AVStream *st, const AVPacket
 {
     int ret = 1, extradata_isom = 0;
     uint8_t *b = pkt->data;
-    WHIPContext *whip = s->priv_data;
+    RTCContext *rtc = s->priv_data;
 
     if (st->codecpar->codec_id == AV_CODEC_ID_H264) {
         extradata_isom = st->codecpar->extradata_size > 0 && st->codecpar->extradata[0] == 1;
         if (pkt->size >= 5 && AV_RB32(b) != 0x0000001 && (AV_RB24(b) != 0x000001 || extradata_isom)) {
             ret = ff_stream_add_bitstream_filter(st, "h264_mp4toannexb", NULL);
-            av_log(whip, AV_LOG_VERBOSE, "Enable BSF h264_mp4toannexb, packet=[%x %x %x %x %x ...], extradata_isom=%d\n",
+            av_log(rtc, AV_LOG_VERBOSE, "Enable BSF h264_mp4toannexb, packet=[%x %x %x %x %x ...], extradata_isom=%d\n",
                 b[0], b[1], b[2], b[3], b[4], extradata_isom);
         } else
-            whip->h264_annexb_insert_sps_pps = 1;
+            rtc->h264_annexb_insert_sps_pps = 1;
     }
 
     return ret;
@@ -702,7 +702,7 @@ const FFOutputFormat ff_whip_muxer = {
     .p.video_codec      = AV_CODEC_ID_H264,
     .p.flags            = AVFMT_GLOBALHEADER | AVFMT_NOFILE | AVFMT_EXPERIMENTAL,
     .p.priv_class       = &whip_muxer_class,
-    .priv_data_size     = sizeof(WHIPContext),
+    .priv_data_size     = sizeof(RTCContext),
     .init               = whip_init,
     .write_packet       = whip_write_packet,
     .deinit             = whip_deinit,

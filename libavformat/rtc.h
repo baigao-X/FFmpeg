@@ -32,34 +32,34 @@
 #include "libavutil/log.h"
 #include "libavutil/opt.h"
 
-enum WHIPState {
-    WHIP_STATE_NONE,
+enum RTCState {
+    RTC_STATE_NONE,
 
     /* The initial state. */
-    WHIP_STATE_INIT,
+    RTC_STATE_INIT,
     /* The muxer has sent the offer to the peer. */
-    WHIP_STATE_OFFER,
+    RTC_STATE_OFFER,
     /* The muxer has received the answer from the peer. */
-    WHIP_STATE_ANSWER,
+    RTC_STATE_ANSWER,
     /**
      * After parsing the answer received from the peer, the muxer negotiates the abilities
      * in the offer that it generated.
      */
-    WHIP_STATE_NEGOTIATED,
+    RTC_STATE_NEGOTIATED,
     /* The muxer has connected to the peer via UDP. */
-    WHIP_STATE_UDP_CONNECTED,
+    RTC_STATE_UDP_CONNECTED,
     /* The muxer has sent the ICE request to the peer. */
-    WHIP_STATE_ICE_CONNECTING,
+    RTC_STATE_ICE_CONNECTING,
     /* The muxer has received the ICE response from the peer. */
-    WHIP_STATE_ICE_CONNECTED,
+    RTC_STATE_ICE_CONNECTED,
     /* The muxer has finished the DTLS handshake with the peer. */
-    WHIP_STATE_DTLS_FINISHED,
+    RTC_STATE_DTLS_FINISHED,
     /* The muxer has finished the SRTP setup. */
-    WHIP_STATE_SRTP_FINISHED,
+    RTC_STATE_SRTP_FINISHED,
     /* The muxer is ready to send/receive media frames. */
-    WHIP_STATE_READY,
+    RTC_STATE_READY,
     /* The muxer is failed. */
-    WHIP_STATE_FAILED,
+    RTC_STATE_FAILED,
 };
 
 /**
@@ -70,7 +70,7 @@ enum WHIPState {
  */
 #define DTLS_SRTP_KEY_LEN 16
 #define DTLS_SRTP_SALT_LEN 14
-#define WHIP_US_PER_MS 1000
+#define RTC_US_PER_MS 1000
 
 /**
  * Maximum size of the buffer for sending and receiving UDP packets.
@@ -81,11 +81,11 @@ enum WHIPState {
  */
 #define MAX_UDP_BUFFER_SIZE 4096
 
-typedef struct WHIPContext {
+typedef struct RTCContext {
     AVClass *av_class;
 
     /* The state of the RTC connection. */
-    enum WHIPState state;
+    enum RTCState state;
 
     /* Parameters for the input audio and video codecs. */
     AVCodecParameters *audio_par;
@@ -137,20 +137,20 @@ typedef struct WHIPContext {
 
     /* The SDP answer received from the WebRTC server. */
     char *sdp_answer;
-    /* The resource URL returned in the Location header of WHIP HTTP response. */
-    char *whip_resource_url;
+    /* The resource URL returned in the Location header of WHIP/WHEP HTTP response. */
+    char *rtc_resource_url;
 
     /* These variables represent timestamps used for calculating and tracking the cost. */
-    int64_t whip_starttime;
-    int64_t whip_init_time;
-    int64_t whip_offer_time;
-    int64_t whip_answer_time;
-    int64_t whip_udp_time;
-    int64_t whip_ice_time;
-    int64_t whip_dtls_time;
-    int64_t whip_srtp_time;
-    int64_t whip_last_consent_tx_time;
-    int64_t whip_last_consent_rx_time;
+    int64_t rtc_starttime;
+    int64_t rtc_init_time;
+    int64_t rtc_offer_time;
+    int64_t rtc_answer_time;
+    int64_t rtc_udp_time;
+    int64_t rtc_ice_time;
+    int64_t rtc_dtls_time;
+    int64_t rtc_srtp_time;
+    int64_t rtc_last_consent_tx_time;
+    int64_t rtc_last_consent_rx_time;
 
     /* The certificate and private key content used for DTLS handshake */
     char cert_buf[MAX_CERTIFICATE_SIZE];
@@ -192,14 +192,14 @@ typedef struct WHIPContext {
     int pkt_size;
     int buffer_size;/* Underlying protocol send/receive buffer size */
     /**
-     * The optional Bearer token for WHIP Authorization.
+     * The optional Bearer token for WHIP/WHEP Authorization.
      * See https://www.ietf.org/archive/id/draft-ietf-wish-whip-08.html#name-authentication-and-authoriz
      */
     char* authorization;
     /* The certificate and private key used for DTLS handshake. */
     char* cert_file;
     char* key_file;
-} WHIPContext;
+} RTCContext;
 
 int ff_rtc_initialize(AVFormatContext *s);
 
